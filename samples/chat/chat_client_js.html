@@ -1,0 +1,214 @@
+<html>
+
+<head>
+    <style type="text/css">
+        div.chat_line {
+            background-color: #DDD;
+            width:auto;
+            padding: 2px 5px;
+            border-radius: 5px;
+        }
+        
+        div.client {
+            background-color: #DFF;
+            float: right;
+        }
+        
+        div.server {
+            background-color: #EEE;
+            float: left;
+        }
+        
+        
+        </style>
+</head>
+
+<body>
+    
+    <div style="width:400px">
+        <table id="connect_div" style="width:100%">
+            <tr><td style="width:100%">
+                    <input type=text id="name_input" value="my_name" style="display:block; width:100%"></input>
+                </td>
+                <td>
+                    <button id="connect_button" onclick="javascript:connect();">connect</button>
+                </td>
+            </tr>
+        </table>
+        
+        <table id="disconnect_div" style="width:100%">
+            <tr><td style="width:100%">
+                    Connected as <span id="connected_as"></span>
+                </td>
+                <td>
+                    <button id="disconnect_button" onclick="javascript:disconnect();">disconnect</button>
+                </td>
+            </tr>
+        </table>
+        <table id="log" style="width:100%; border:solid 1px gray;">
+        </table>
+        <table style="width:100%">
+            <tr>
+                <td style="width:100%">
+                    <input type="text" id="input_text" style="display:block; width:100%"/>
+                </td>
+                <td>
+                    <button id="send_button" disabled onclick="javascript:input_received();">send</button>
+                </td>
+            </tr>
+        </table>
+    </div>
+    
+    <script>
+        var ws = null;
+        var log_lines = [];
+        var enabled = false;
+
+        document.getElementById("input_text").onkeyup = function(event)
+        {
+            if (event.keyCode === 13) {
+                // Cancel the default action, if needed
+                event.preventDefault();
+                // Trigger the button element with a click
+                document.getElementById("send_button").click();
+              }
+        }
+        
+        function connection_controller(connect_callback, disconnect_callback)
+        {
+            this.connect_div = document.getElementById("connect_div");
+            this.disconnect_div = document.getElementById("disconnect_div");
+            this.connect_button = document.getElementById("connect_button");
+            this.disconnect_button = document.getElementById("disconnect_button");
+            this.name_input = document.getElementById("name_input");
+            this.connected_as = document.getElementById("connected_as");
+            this.connect_callback = connect_callback;
+            this.disconnect_callback = disconnect_callback;
+            
+            function show(element)
+            {
+                element.style.display = "block";
+            }
+            
+            function hide(element)
+            {
+                element.style.display = "none";
+            }
+            
+            show(this.connect_div);
+            hide(this.disconnect_div);
+            
+            var cc = this;
+            
+            this.connect_button.onclick = function(event)
+            {
+                var name = cc.name_input.value;
+                cc.connected_as.innerText = name;
+                cc.connect_callback(name);
+                hide(cc.connect_div);
+                show(cc.disconnect_div);
+            };
+            
+            this.disconnect_button.onclick = function(event)
+            {
+                cc.disconnect_callback();
+                hide(cc.disconnect_div);
+                show(cc.connect_div);
+            };
+        }
+        
+        function log_display(element_name, nlines)
+        {
+            this.table = document.getElementById(element_name);
+            this.nlines = nlines;
+            this.lines = [];
+            this.tds = [];
+            
+            for( var i = 0; i < this.nlines; i++ )
+            {
+                var tr = document.createElement("tr");
+                this.table.appendChild(tr);
+                var td = document.createElement("td");
+                tr.appendChild(td);
+                td.innerHTML="&nbsp;"
+                this.tds.push(td);
+            }
+            
+            this.add_line = function(who, text)
+            {
+                this.lines.push({who:who, text:text});
+                while( this.lines.length > this.nlines )
+                   this.lines.splice(0, 1);
+                for( var i=0; i < this.lines.length; i++ )
+                {
+                    var td = this.tds[i];
+                    var line = this.lines[i];
+                    var text = line.text == "" ? "&nbsp;" : line.text;
+                    td.innerHTML = '<div class="chat_line '+ line.who +'">' + text + '</div>';
+                }
+            }
+        }
+
+        var log = new log_display("log", 10);
+
+        function connect(name)
+        {
+            if ( ws != null )
+                ws.close();
+            ws = new WebSocket("ws://localhost:8080/chat/"+name);
+            
+            ws.onmessage = function(event)
+            {
+                var text = event.data;
+                var words = text.split(":", 3);
+                var from = words[0];
+                var to = words[1];
+                var message = words[2];
+                log.add_line("server", from + ": " + message);
+            };
+            
+            ws.onopen = function(event)
+            {
+                enabled = true;
+                var b = document.getElementById("send_button");
+                b.disabled = false;
+            }
+        }
+        
+        function disconnect()
+        {
+            if( ws != null )
+            {
+                ws.close();
+                ws = null;
+            }
+            var b = document.getElementById("send_button");
+            b.disabled = true;
+        }
+        
+        var conn_con = new connection_controller(connect, disconnect);
+        
+        function input_received()
+        {
+            var text = document.getElementById("input_text").value;
+            document.getElementById("input_text").value = "";
+            var to = "";
+            if( text.substring(0, 1) == "." )
+            {
+                to = ".";
+                text = text.substring(1);
+            }
+            else if( text.substring(0, 1) == "@" )
+            {
+                var parts = text.split(" ", 2);
+                to = parts[0].substring(1);
+                text = parts[1].trim();
+            }
+            ws.send(to + ":" + text);
+            log.add_line("client", text);
+        }
+        
+    </script>
+
+</body>
+</html>

@@ -1,24 +1,54 @@
 from socket import *
-from pythreader import TaskQueue, Task, Primitive, PyThread, synchronized
+from pythreader import Primitive, synchronized
 from threading import RLock
-import sys, hashlib, base64, struct, random, traceback, os
-import numpy as np
+import sys, hashlib, base64, struct, random, traceback, os, errno, time
 from urllib.parse import urlsplit, urlunsplit
+from socket import timeout as socket_timeout
 
 class EOF(Exception):
-    def __init__(self, message):
+    def __init__(self, message=""):
         self.Message = message
         
     def __str__(self):
-        return f"Websocket EOF: {self.Message}"
+        msg = ": "+self.Message if self.Message else ""
+        return f"Websocket EOF{msg}"
     
     __repr__ = __str__
+
+class Timeout(Exception):
+    def __init__(self, message=""):
+        self.Message = message
+        
+    def __str__(self):
+        msg = ": "+self.Message if self.Message else ""
+        return f"Websocket timeout{msg}"
+    
+    __repr__ = __str__
+
+
+class WebsocketHeader(object):
+    
+    def __init__(self, headline, headers):
+        self.Path = self.Status = self.Method = None
+        self.Headline = headline
+        self.Headers = headers
+        words = headline.split(None, 2)
+        if words[0].lower().startswith("http/"):
+            # response
+            self.Protocol, status, self.Message = words
+            self.Status = int(status)
+        else:
+            # request
+            self.Method, self.Path, self.Protocol = words
+        
+WebsocketRespone = WebsocketRequest = WebsocketHeader
 
 WebSocketVersion = "13"
 
 class WebsocketPeer(Primitive):
     
-    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"           # defined by RFC6455
+    
     Debug = False
         
     def __init__(self, sock = None, send_masked = False, max_fragment = None):
@@ -33,6 +63,7 @@ class WebsocketPeer(Primitive):
         self.MaxFragment = max_fragment
         self.SendLock = RLock()
         self.RecvLock = RLock()
+        self.BufferedFragments = []         # [(fin, opcode, data),... ]
         
     @synchronized
     def set_socket(self, sock):
@@ -58,6 +89,7 @@ class WebsocketPeer(Primitive):
         return l.decode("utf-8")
         
     def recv_handshake(self):
+        # receive handshake response
         with self.RecvLock:
             headline = None
             headers = {}
@@ -74,20 +106,58 @@ class WebsocketPeer(Primitive):
                     else:
                         words = l.split(":", 1)
                         headers[words[0]] = words[1].strip()
-            return headline, headers
+            return WebsocketHeader(headline, headers)
+            
+    recv_request = recv_handshake
+    recv_response = recv_handshake
 
-    def send_handshake(self, headline, headers):
+    def send_response(self, request, headers={}, status="101 Switching Protocols"):
+        headline = f"HTTP/1.1 {status}"
+        h = hashlib.sha1()
+        key = request.Headers["Sec-WebSocket-Key"] + WebsocketPeer.GUID
+        h.update(key.encode("utf-8"))
+        response_headers = {
+                "Upgrade": "websocket",
+                "Connection": "Upgrade",
+                "Sec-WebSocket-Accept": base64.b64encode(h.digest()).decode("utf-8")
+        }
+        response_headers.update(headers)
+        
         with self.SendLock:
-            response = [headline] + ["%s: %s" % (k, v) for k, v in headers.items()]
+            response = [headline] + ["%s: %s" % (k, v) for k, v in response_headers.items()]
             response = "\r\n".join(response) + "\r\n\r\n"
             self.Sock.sendall(response.encode("utf-8"))
+            
+    def send_request(self, uri, host, port, headers={}):
+        headline = f"GET {uri} HTTP/1.1"
+        key = os.urandom(16)
+        key = base64.b64encode(key).decode("utf-8")
+        hdict = {
+            "Host":                 f"{host}:{port}",
+            "Upgrade":              "websocket",
+            "Connection":           "Upgrade",
+            "Sec-WebSocket-Version": WebSocketVersion,
+            "Sec-WebSocket-Key":    key
+        }
         
-    def recv_fragment(self):
+        hdict.update(headers)
+
+        with self.SendLock:
+            request = [headline] + ["%s: %s" % (k, v) for k, v in hdict.items()]
+            request = "\r\n".join(request) + "\r\n\r\n"
+            self.Sock.sendall(request.encode("utf-8"))
+            
+    def recv_fragment(self, buffered=None):
+        fin, opcode, data = None, None, None
+        close_received = False
         with self.RecvLock:
-            if self.Closed:
+            if self.CloseReceived:
                 raise EOF("Websocket has been closed")
         
-            b = self.Sock.recv(1, MSG_WAITALL)
+            if buffered is not None:
+                b = buffered
+            else:
+                b = self.Sock.recv(1, MSG_WAITALL)
             if not b:
                 raise EOF("Peer disconnected while reading a fragment")
             b = b[0]
@@ -101,10 +171,19 @@ class WebsocketPeer(Primitive):
             mask_flag = (b >> 7) & 1
             length = b & 127
         
+            if length < 126:
+                pass
+            elif length == 126:
+                l = self.Sock.recv(2, MSG_WAITALL)
+                length = struct.unpack("!H", l)[0]
+            else:
+                l = self.Sock.recv(8, MSG_WAITALL)
+                length = struct.unpack("!Q", l)[0]
+
             if self.Debug:
                 print("recv_fragment: fin:", fin, "   opcode:", opcode, "   mask_flag:", mask_flag, "   length:", length)
         
-            assert length < 126
+
         
             mask = None
         
@@ -135,6 +214,7 @@ class WebsocketPeer(Primitive):
                     if length > 2:
                         self.ClosedReason = fragment[2:].decode("utf-8")     
                 data = b''
+                close_received = True
         
             if opcode == 9: # ping
                 self.Sock.send(b"\x0a\x00")
@@ -145,47 +225,97 @@ class WebsocketPeer(Primitive):
                 elif opcode == 2:
                     print("        data: [%s]" % (data.hex(),))
 
-            return fin, opcode, data
+        if close_received:      # do this after releasing the RecvLock
+            self.send_close()
+
+        return fin, opcode, data
         
     #@synchronized
     def send_close(self, code=None, reason=None):
         with self.SendLock:
-            body = b''
-            if code is not None:
-                body = struct.pack('!H', code)
-                if reason:
-                    body = body + reason.encode("utf-8")
-            self.send_fragment(True, 8, self.SendMasked, body)
+            if not self.CloseSent:
+                body = b''
+                if code is not None:
+                    body = struct.pack('!H', code)
+                    if reason:
+                        body = body + reason.encode("utf-8")
+                self.send_fragment(True, 8, self.SendMasked, body)
+                #print("close sent")
+                self.CloseSent = True
         
-    #@synchronized
-    def recv(self):
-        #print("recv(): Closed=", self.Closed)
-        if self.Closed:
+    def peek(self, timeout=0):
+        if self.closed():
             raise EOF("Websocket has been closed")
-        fragments = []
-        final = False
-        eof = False
-        binary = None
-        first_fragment = True
-        while not final and not eof:
-            try:    final, opcode, fragment = self.recv_fragment()
-            except EOF as e:
-                self.shutdown(str(e))
-                raise
-            if first_fragment:
-                assert opcode != 0
-                binary = opcode == 2
-                first_fragment = False
-            if fragment:
-                fragments.append(fragment)
-            eof = opcode == 8
-        data = b''.join(fragments)
-        if not binary:  data = data.decode("utf-8")
-        if eof: 
-            #print("recv: closing")
-            self.close()
-        return data
-        
+        with self.RecvLock:
+            saved_timeout = self.Sock.gettimeout()
+            self.Sock.settimeout(timeout)
+            try:
+                try:    b = self.Sock.recv(1)
+                except socket_timeout:
+                    return False
+                except OSError as exc:
+                    if exc.errno == errno.EWOULDBLOCK:
+                        return False
+                    else:
+                        raise
+                try:
+                    fragment = self.recv_fragment(buffered=b)
+                    self.BufferedFragments.append(fragment)
+                except EOF:
+                    pass
+                return True
+            finally:
+                self.Sock.settimeout(saved_timeout)
+                 
+    def recv(self, timeout=None):
+        #print("recv(): Closed=", self.Closed)
+        with self.RecvLock:
+            if self.closed():
+                raise EOF("Websocket has been closed")
+            fragments = []
+            final = False
+            eof = False
+            binary = None
+            first_fragment = True
+            while not final and not eof:
+                if timeout is not None:
+                    if not self.peek(timeout):
+                        raise Timeout()
+                try:    final, opcode, fragment = self.recv_fragment()
+                except EOF as e:
+                    self.shutdown(str(e))
+                    raise
+                if first_fragment:
+                    assert opcode != 0
+                    binary = opcode == 2
+                    first_fragment = False
+                if fragment:
+                    fragments.append(fragment)
+                eof = opcode == 8
+            data = b''.join(fragments)
+            if not binary:  data = data.decode("utf-8")
+            if eof: 
+                #print("recv: closing")
+                self.close()
+            return data
+            
+    def skip_one(self, tmo=None):
+        try:    self.recv(timeout=tmo)
+        except Timeout:
+            pass
+        except EOF:
+            pass
+
+    def skip(self, tmo=None):
+        t0 = time.time()
+        t1 = None if tmo is None else t0 + tmo
+        while True:
+            dt = None if tmo is None else t1 - time.time()
+            if dt is None or dt > 0.0:
+                self.skip_one(dt)
+            elif dt <= 0.0:
+                break
+
     def send_pong(self):
         with self.SendLock:
             self.Sock.send(b"\x0a\x00")
@@ -197,6 +327,7 @@ class WebsocketPeer(Primitive):
         mask = (mask*n)[:len(buf)]
         return bytes([x^m for x, m in zip(buf, mask)])
         
+    @synchronized
     def send_fragment(self, fin, opcode, mask, data):
         with self.SendLock:
             assert opcode < 16
@@ -216,9 +347,7 @@ class WebsocketPeer(Primitive):
                 mask = struct.pack('!H', r1) + struct.pack('!H', r2)
                 hdr = hdr + mask
                 data = self.mask(mask, data)
-            self.Sock.sendall(hdr)
-            if data:
-                self.Sock.sendall(data)
+            self.Sock.sendall(hdr + (data or b''))
             
     @synchronized
     def shutdown(self, status=""):
@@ -227,12 +356,12 @@ class WebsocketPeer(Primitive):
             self.Sock = None
             self.CloseStatus = status
         self.Closed = True
-        
     
     #
     # Usable methods
     #
     
+    @synchronized
     def send(self, message):
         with self.SendLock:
             if not self.CloseReceived and not self.Closed and not self.CloseSent:
@@ -256,142 +385,43 @@ class WebsocketPeer(Primitive):
     def close(self, code=1000, reason=None):
         #print("call close()")
         if not self.Closed:
-            if not self.CloseSent:
-                self.send_close(code, reason)
-                self.CloseSent = True
+            self.send_close(code, reason)
             while not self.CloseReceived:
                 self.recv_fragment()
+            #print("close received")
             self.shutdown()
+            #print("closed")
+        else:
+            #print("already closed")
+            pass
+            
+    def closed(self):
+        return self.CloseReceived or self.Closed
             
     def messages(self):
-        while not self.Closed:
+        while not self.closed():
             try:    msg = self.recv()
             except EOF as e:
                 self.ClosedStatus = e.Message
                 break
             if msg:
                 yield msg
+                
+    def __iter__(self):
+        return self.messages()
         
     def run(self, callback_delegate=None):
         stop = False
         for message in self.messages():
-            if callback_delegate is not None:
+            if callback_delegate is not None and hasattr(callback_delegate, "on_message"):
                 stop = callback_delegate.on_message(self, message) == "stop"
                 if stop:
                     break
         else:
-            if callback_delegate is not None:
-                callback_delegate.on_close(self, self.ClosedStatus)                    
+            if callback_delegate is not None and hasattr(callback_delegate, "on_close"):
+                callback_delegate.on_close(self, self.ClosedStatus)      
 
-class WebsocketReceiver(Task):
 
-    def __init__(self, app, sock, address, handler_factory, ws_args):
-        Task.__init__(self)
-        self.Sock = sock
-        self.HandlerFactory = handler_factory
-        self.Address = address
-        self.WSArgs = ws_args
-        self.App = app
-        
-    def run(self):
-        try:
-            #
-            # Handshake
-            #
-            ws = WebsocketPeer(self.Sock, **self.WSArgs)
-            request_headline, request_headers = ws.recv_handshake()
-            path = request_headline.split()[1]
-            
-            #print("WebsocketReceiver: handshake received:", request_headline, request_headers)
-            
-            handler = self.HandlerFactory(self.App, ws)
-            assert isinstance(handler, WSHandler)
-            
-            headers = handler.handshake(self.Address, path, request_headers) or {}
-            
-            #print("WebsocketReceiver: initialized:", headers)
-            
-            h = hashlib.sha1()
-            key = request_headers["Sec-WebSocket-Key"] + WebsocketPeer.GUID
-            h.update(key.encode("utf-8"))
-            response_headers = {
-                    "Upgrade": "websocket",
-                    "Connection": "Upgrade",
-                    "Sec-WebSocket-Accept": base64.b64encode(h.digest()).decode("utf-8")
-            }
-            
-            response_headers.update(headers)
-            ws.send_handshake("HTTP/1.1 101 Switching Protocols", response_headers)
-            
-            #print("WebsocketReceiver: handler created:", handler)
-            handler.run()
-        except:
-            traceback.print_exc()
-            raise
-        finally:
-            ws.close()
-
-class WebsocketServer(PyThread):
-    
-    def __init__(self, port, handler_factory, app, max_connections=10, max_queued=30, **ws_args):
-        PyThread.__init__(self)
-        self.Port = port
-        self.HandlerFactory = handler_factory
-        self.HandlerQueue = TaskQueue(max_connections, capacity=max_queued)
-        self.App = app
-        self.WSArgs = ws_args
-        
-    def run(self):
-        srv_sock = socket(AF_INET, SOCK_STREAM)
-        srv_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        srv_sock.bind(("", self.Port))
-        srv_sock.listen(5)
-        
-        while True:
-            sock, address = srv_sock.accept()
-            receiver = WebsocketReceiver(self.App, sock, address, self.HandlerFactory, self.WSArgs)
-            try:
-                self.HandlerQueue.addTask(receiver)
-            except:
-                # ws response here !
-                sock.close()
-
-class WSHandler(object):
-    
-    def __init__(self, app, ws):
-        #Primitive.__init__(self)
-        self.App = app
-        self.WS = ws
-        
-    def handshake(self, client_address, path, request_headers):
-        self.ClientAddress = client_address
-        self.Path = path
-        self.RequestHeaders = request_headers
-        return {}
-        
-    def run(self):
-        self.WS.close()
-        
-    def send(self, message):
-        return self.WS.send(message)
-        
-    def recv(self):
-        return self.WS.recv()
-        
-    def __iter__(self):
-        return self.WS.messages()
-        
-class WSApp(Primitive):
-    
-    def __init__(self, handler_factory):
-        Primitive.__init__(self)
-        self.HandlerFactory = handler_factory
-        
-    def run_server(self, port, **args):
-        server = WebsocketServer(port, self.HandlerFactory, self, **args)
-        server.start()
-        server.join()
-        
 def connect(url, headers = {}, **args):
         parsed = urlsplit(url, scheme="ws")
         assert parsed.scheme == "ws"
@@ -420,19 +450,16 @@ def connect(url, headers = {}, **args):
         sock = socket(AF_INET, SOCK_STREAM)
         sock.connect((host, port))
         ws = WebsocketPeer(sock, send_masked = True, **args)
-        ws.send_handshake(headline, hdict)
+        ws.send_request(uri, host, port)
         
-        response_headline, response_headers = ws.recv_handshake()
-        #print("response_headline:", response_headline)
-        protocol, status, message = response_headline.split(None, 2)
-        status = int(status)
+        response = ws.recv_response()
 
-        if status == 101:
-            ws.Protocol = protocol
-            ws.ConnectMessage = message
-            ws.ResponseHeaders = response_headers
+        if response.Status == 101:
+            ws.Protocol = response.Protocol
+            ws.ConnectMessage = response.Message
+            ws.ResponseHeaders = response.Headers
             return ws
         else:
-            raise ConnectionError(status, message)
+            raise ConnectionError(response.Status, response.Message)
         
     

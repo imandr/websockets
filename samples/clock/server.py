@@ -1,6 +1,7 @@
 from ws import WSHandler, WSApp
+import time
 
-class EchoHandler(WSHandler):
+class ClockHandler(WSHandler):
     
     def handshake(self, address, request):
         print(f"Server initialized at {request.Path} with headers:")
@@ -8,10 +9,11 @@ class EchoHandler(WSHandler):
             print(f"   {k}: {v}")
         
     def run(self):
-        for msg in self.WS:
-            self.WS.send(msg)
+        while not self.WS.closed():
+            self.WS.send(time.ctime())
+            self.WS.skip(1.0)
 
-app = WSApp(EchoHandler)
-app.run_server(8080)
+app = WSApp(ClockHandler)
+app.run_server(8765)
     
     

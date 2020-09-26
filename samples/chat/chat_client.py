@@ -3,7 +3,7 @@ import sys, tty
 from pythreader import PyThread, synchronized
 
 my_name = sys.argv[1]
-url = sys.argv[2] if len(sys.argv) > 2 else "ws://localhost:8765/chat"
+url = sys.argv[2] if len(sys.argv) > 2 else "ws://localhost:8080/chat"
 
 class ChatClient(PyThread):
     
@@ -21,6 +21,9 @@ class ChatClient(PyThread):
                     if line[0] == '@':
                         to, msg = line.split(None, 1)
                         to = to[1:]
+                    elif line[0] == '.':
+                        to = '.'
+                        msg = line[1:].strip()
                     else:
                         to = ''
                         msg = line
@@ -60,7 +63,7 @@ class ChatClient(PyThread):
     def on_close(self, ws, status):
         print("[Closed: %s]" % (status,))
     
-ws = connect(url, headers={"X-Chat-Name": my_name})
+ws = connect(url+"/my_name", headers={"X-Chat-Name": my_name})
 print("Connected to server. Press space to enter a message.")
 c = ChatClient(ws)
 c.run()

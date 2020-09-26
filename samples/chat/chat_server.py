@@ -3,12 +3,14 @@ from pythreader import synchronized
 
 class ChatHandler(WSHandler):
     
-    def handshake(self, address, path, headers):
-        self.Name = headers["X-Chat-Name"]
+    def handshake(self, address, request):
+        path = request.Path
+        assert path.startswith("/chat/")
+        self.Name = path[6:]
         self.App.register(self, self.Name)
         
     def run(self):
-        for msg in self:
+        for msg in self.WS:
             if isinstance(msg, bytes):
                 msg = msg.decode("utf-8")
             dst, text = msg.split(":", 1)
@@ -17,12 +19,12 @@ class ChatHandler(WSHandler):
         
     def say(self, src, dst, message):
         message = "%s:%s:%s" % (src, dst, message)
-        self.send(message)
+        self.WS.send(message)
         
 class ChatApp(WSApp):
     
-    def __init__(self, handler_factory):
-        WSApp.__init__(self, handler_factory)
+    def __init__(self, handler):
+        WSApp.__init__(self, handler)
         self.Clients = {}       # name -> handler
         
     @synchronized
@@ -42,12 +44,19 @@ class ChatApp(WSApp):
         
     @synchronized
     def send(self, src, dst, text, exclude=None):
-        print("send: %s->%s: %s", src, dst or "", text)
-        to = [dst] if dst else list(self.Clients.keys())
-        for name in to:
-            if name in self.Clients and name != src and name != exclude:
-                self.Clients[name].say(src, dst, text)
+        print("send: %s->%s: %s" % (src, dst or "", text))
+        if dst == '.':
+            # control
+            if text == "who":
+                users = self.Clients.keys()
+                reply = "\n - " + "\n - ".join(users)
+                self.Clients[src].say(".", src, reply)
+        else:
+            to = [dst] if dst else list(self.Clients.keys())
+            for name in to:
+                if name in self.Clients and name != src and name != exclude:
+                    self.Clients[name].say(src, dst, text)
     
 
 app = ChatApp(ChatHandler)
-app.run_server(8765)
+app.run_server(8080)
